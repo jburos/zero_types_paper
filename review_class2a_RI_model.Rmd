@@ -1,0 +1,261 @@
+---
+title: "Review class IIa models"
+author: "Jacqueline Buros"
+date: "12/3/2018"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(rstan)
+library(bayesplot)
+set.seed(1584639)
+options(mc.cores = 4)
+library(tidyverse)
+```
+
+In this document we will review the **random intercept (RI) model** presented in the Bioarxiv paper by Silverman et al [Naught all zeros in count data are the same](https://www.biorxiv.org/content/early/2018/11/26/477794).
+
+This model is classified as a "class IIa model" (Patial Technical Bias Model) in the above manuscript. By their description, these are models that _account for technical bias as seen in a partial technical process._
+
+> For example, consider a situation where DNA from a specified transcript is amplified with different efficiency between batches (e.g. PCR bias differs between batches).
+
+In this document, as in the paper, we will consider a scenario in which frequencies of a **single transcript** are quantified across batches & samples.
+
+## The model
+
+The observed counts $y_i$ are distributed according to a Poisson with a rate parameter depends on the sample $z_i$ and the batch $x_i$:
+
+$$ y_i \sim \text{Poisson}(\lambda_{z_i}\eta_{x_i}) $$
+
+where $\eta_m$ is defined per batch (considered a 'multiplicative bias'):
+
+$$ \eta_m \sim \text{LogNormal}(\nu, \omega^2) \text{; } \eta_1 = 1 $$
+
+and $\lambda_k$ is defined per sample (and represents a sample-specific rate):
+
+$$ \lambda_k \sim \text{LogNormal}(\mu, \sigma^2) $$
+
+Finally the model includes a hyper-prior on the sample-specific rate $\mu$ representing a geometric mean abundance across our samples, excluding technical bias:
+
+$$ \mu \sim \text{Normal}(\rho, \tau^2) $$
+
+It is notable in the above that the constraint on $\eta$ such that $\eta_1 = 1$ reflects an assumption that the batch labelled "1" is the so-called unbiased sample. Your particular data may or may not contain a batch that is more reliable than the others.
+
+The paper does not describe how one would generalize this model to several transcripts, although such a generalization is likely relevant to their discussion. In addition, it is likely that any estimate of differential expression would be modeled as a difference in $\mu$ per transcript according to experimental conditions (thus, representing the difference in expression in the absence of any technical bias), but this is also not specifically described by the authors in the methods.
+
+# Data simulation
+
+It can be helpful to see simulated data according to this process, in order to better understand the practical significance of each of the steps described above.
+
+Importantly, this type of model assumes that **the zero values observed are due to sampling variance** (ie a zero value is more likely for a transcript with low abundance), but that the magnitude of this sampling variance differs according to technical bias within the batch.
+
+The [simulation_bayes.R](simulation/simulation_bayes.R) file in the paper's repository includes the following code for data simulation:
+
+```{r sim-data-paper}
+dat <- list()
+# Universal priors
+lambda_prior <- c(5, 3)
+theta_prior <- c(.5, .5)
+gamma_prior <- c(1, 1)
+
+# Type IIa Zeroes
+lambdas <- c(1.4, 0.6, 3.2)
+batch <- rep(1:3, each=5)
+counts <- c(0,1,2,3,1,0,1,0,2,0,8,1,2,0,5)
+dat$type2a <- within(list(), {
+  y <- counts
+  x <- batch
+  z <- rep(1, length(y))
+  N <- length(y)
+  N_person <- length(unique(z))
+  N_batch <- length(unique(x))
+  lambda_prior <- lambda_prior
+  theta_prior <- theta_prior
+  gamma_prior <- gamma_prior
+})
+str(dat$type2a)
+```
+
+Here the authors are simulating data for a single transcript with 3 batches and 5 technical replicates per batch.
+
+We can also simulate these data according to the data-generating process described above. We will modify the names of some parameters for clarity. We will additionally borrow from the above in conjuction with the Stan code provided in ([m2a.stan](simulation/m2a.stan)) to derive hyper-prior values ($\rho = -1; \tau = 5; \sigma = 3; \nu = 0; \omega = 2$)).
+
+```{r sim-data-ourselves}
+ours <- list()
+
+# params
+n_persons <- 1 # k
+n_batches <- 3 # m
+n_replicates <- 5
+n_obs <- n_persons*n_batches*n_replicates
+
+# hyper-priors
+rho <- -1
+tau <- 5
+sigma <- 3
+nu <- 0
+omega <- 2
+
+# simulation
+mu <- rnorm(rho, tau, n = 1)
+eta <- rlnorm(mu, sigma, n = n_batches)
+lambda <- rlnorm(nu, omega, n = n_persons)
+x <- rep(seq_len(n_batches), each = n_persons*n_replicates)  # batch identifier
+z <- rep(seq_len(n_persons), times = n_batches*n_replicates) # person/sample identifier
+y <- rpois(lambda[z]*eta[x], n = n_obs)
+sim_data <- dplyr::tibble(x, z, y, 
+                          lambda = lambda[z], 
+                          eta = eta[x])
+str(sim_data)
+```
+
+With only 5 technical replicates, it is very difficult to evaluate whether the simulated data are reasonable. For example, if we repeat this process a few times we will get very different results each time.
+
+_Aside: this process of simulating data using the priors in our model has a name -- we call these values [Prior predictive values](https://betanalpha.github.io/assets/case_studies/principled_bayesian_workflow.html#sec:prior-model) and their distribution is the "prior predictive distribution". Reviewing these values to see whether the resulting distribution is reasonable (before reviewing observed data) is a standard part of the bayesian analysis workflow._
+
+At any rate, in our case we want to use this data-generating process to better understand the assumptions of our model. 
+
+First, we will wrap the above in a function so that we can repeat it several times. (Note here that the default values are set according to those used by the paper).
+
+```{r sim-data-function}
+sim_data_2a <- function(n_persons = 1, n_batches = 3, n_replicates = 5, rho = -1, tau = 5, sigma = 3, nu = 0, omega = 2) {
+  n_obs <- n_persons*n_batches*n_replicates
+  mu <- rnorm(rho, tau, n = 1)
+  eta <- double(length = n_batches)
+  eta[1] <- 1
+  if (n_batches > 1)
+    eta[2:n_batches] <- rlnorm(mu, sigma, n = n_batches-1)
+  lambda <- rlnorm(nu, omega, n = n_persons)
+  x <- rep(seq_len(n_batches), each = n_persons*n_replicates)  # batch identifier
+  z <- rep(seq_len(n_persons), times = n_batches*n_replicates) # person/sample identifier
+  y <- rpois(lambda[z]*eta[x], n = n_obs)
+  sim_data <- dplyr::tibble(x_batch = x, z_sample = z, y, 
+                            lambda = lambda[z], 
+                            eta = eta[x])
+  structure(sim_data,
+            stan_data = list(y = y, z = z, x = x, 
+                             lambda_prior = c(tau, sigma), 
+                             eta_prior = c(nu, omega),
+                             N = n_obs,
+                             N_person = n_persons,
+                             N_batch = n_batches),
+            true_values = list(eta = eta,
+                               mu = mu,
+                               lambda = lambda))
+}
+```
+
+Let's test this code to see what our simulated data look like:
+
+```{r sim-dat-once}
+sim_data <- sim_data_2a()
+ggplot(sim_data, aes(x = y, fill = factor(x_batch), colour = factor(x_batch))) +
+  geom_histogram(position = 'dodge') +
+  facet_wrap( ~ x_batch + lambda + eta, labeller = label_both) +
+  theme_minimal() + 
+  theme(legend.position = 'None') +
+  scale_x_continuous('Simulated count (y)')
+```
+
+The resulting counts are derived from 3 batches, each with the same value of $\lambda$ and different values of $\eta$.
+
+This should help to illustrate how the zero values are in part a reflection of the low-frequency of the transcript and in part a reflection of the technical "batch" effect.
+
+Seen together (pooling effects across batches), we can see that the frequency of zero-valued counts is _both_ a function of the relative abundance (based on `lambda`) and the technical bias (based on `eta`).
+
+```{r plot-sim-data-once}
+ggplot(sim_data, aes(x = y, fill = factor(x_batch), colour = factor(x_batch))) +
+  geom_histogram(position = 'stack') +
+  theme_minimal() + 
+  scale_x_continuous('Simulated count (y)')
+```
+
+However, this is only a single instance of simulated data. 
+
+If we repeat it a second time, we can get very different distribution of values.
+
+```{r plot-sim-data-again}
+ggplot(sim_data_2a(), aes(x = y, fill = factor(x_batch), colour = factor(x_batch))) +
+  geom_histogram(position = 'stack') +
+  theme_minimal() + 
+  scale_x_continuous('Simulated count (y)')
+```
+
+We can programmatically repeat this many times and plot the "overall" distribution of values.
+
+```{r repeat-sim-data}
+sim_data_multibatch <- purrr::rerun(.n = 1000, sim_data_2a()) %>%
+  dplyr::bind_rows(.id = 'iteration')
+ggplot(sim_data_multibatch, aes(x = y)) +
+  geom_histogram() +
+  theme_minimal() + 
+  theme(legend.position = 'None') +
+  scale_x_continuous('Simulated count (y)', labels = scales::comma)
+```
+
+Notice that we have a high proportion of very low values and a few very (very) high values.
+
+Let's plot this on a log-scale to get a better sense of the distribution of values.
+
+```{r}
+ggplot(sim_data_multibatch, aes(x = y + 1)) +
+  geom_histogram() +
+  theme_minimal() + 
+  theme(legend.position = 'None') +
+  scale_x_log10('Simulated count (y)', labels = scales::comma)
+```
+
+This represents what our data would look like if we had say 1000 transcripts, each of which had a different $\lambda$ and $\eta$ drawn from the priors described above.
+
+We can see that this model is capable of generating a high proportion of zero-valued counts, due in part to technical bias across batches and in part scaled by the relative transcript abundance. While the batch effect is capable of scaling our counts close to zero, it is also capable of scaling our counts up to very high observed frequencies.
+
+While the resulting distribution may or may not look reasonable, it's important to keep in mind the assumptions that the model has made in the above. The degree to which these assumptions are reasonable (and the degree to which these priors are reasonable) will depend a lot on the type of data you are looking at.
+
+## Model fit to simulated data
+
+Nonetheless, assuming we are happy with this model, we can continue with the analysis process and use Stan to try to recover the parameters from simulated data.
+
+Here, we will use these data simulated earlier from our function & plotted above:
+
+```{r fit2a-simulated-data}
+ggplot(sim_data, aes(x = y, fill = factor(x_batch), colour = factor(x_batch))) +
+  geom_histogram(position = 'dodge') +
+  facet_wrap( ~ x_batch + lambda + eta, labeller = label_both) +
+  theme_minimal() + 
+  theme(legend.position = 'None') +
+  scale_x_continuous('Simulated count (y)')
+```
+
+Passing the simulated data to `rstan::stan` in order to sample from the posterior.
+
+```{r fit2a-sampling, results = 'hide'}
+fit2a <- rstan::stan(file = 'stan/m2a.stan',
+                     data = attr(sim_data, 'stan_data'))
+```
+
+```{r fit2a-summary}
+print(fit2a, pars = 'y_rep', include = F)
+```
+
+Comparing the model-estimated values to those used to simulate our data, we can see that our model recovers parameter estimates quite well.
+
+```{r fit2a-recovery}
+bayesplot::mcmc_recover_hist(x = as.array(fit2a, pars = c('eta')), true = attr(sim_data, 'true_values')$eta)
+```
+
+And, not surprisingly, one can "predict" resonably well (given the posterior estimates of parameters) the observed counts.
+
+```{r fit2a-ppcheck}
+bayesplot::mcmc_recover_intervals(x = as.array(fit2a, pars = 'y_rep'),
+                                  true = sim_data$y,
+                                  batch = sim_data$x_batch,
+                                  size = 1,
+                                  facet_args = list(scales = 'free_x'))
+```
+
+
+## Extending for differential expression analysis
+
+The next question is, how would we use this model for a differential expression analysis? (and, related question of how they evaluated this model in the paper?)
+
