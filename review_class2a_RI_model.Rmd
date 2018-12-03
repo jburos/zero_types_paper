@@ -16,7 +16,7 @@ library(tidyverse)
 
 In this document we will review the **random intercept (RI) model** presented in the Bioarxiv paper by Silverman et al [Naught all zeros in count data are the same](https://www.biorxiv.org/content/early/2018/11/26/477794).
 
-This model is classified as a "class IIa model" (Patial Technical Bias Model) in the above manuscript. By their description, these are models that _account for technical bias as seen in a partial technical process._
+This model is classified as a "class IIa model" (Partial Technical Bias Model) in the above manuscript. By their description, these are models that _account for technical bias as seen in a partial technical process._
 
 > For example, consider a situation where DNA from a specified transcript is amplified with different efficiency between batches (e.g. PCR bias differs between batches).
 
